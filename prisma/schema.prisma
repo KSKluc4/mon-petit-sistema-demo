@@ -1,0 +1,551 @@
+// Prisma schema — Sistema Mon Petit
+// Veja CLAUDE.md para a especificação completa do produto.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Apenas dono e vice-dona. Sem tela de cadastro — criados via seed.
+model Usuario {
+  id             String   @id @default(cuid())
+  nome           String
+  login          String   @unique
+  senhaHash      String
+  // Incrementado quando o OUTRO usuário redefine a senha deste (Conta →
+  // Redefinir senha do outro usuário). O JWT carrega o valor visto no login;
+  // se não bater mais com este campo, a sessão é tratada como inválida —
+  // é assim que forçamos logout sem manter uma tabela de sessões.
+  sessionVersion Int      @default(0)
+  criadoEm       DateTime @default(now())
+}
+
+model Cliente {
+  id          String   @id @default(cuid())
+  nome        String
+  telefone    String
+  endereco    String?
+  observacoes String?
+  criadoEm    DateTime @default(now())
+
+  pets Pet[]
+}
+
+enum Especie {
+  CAO
+  GATO
+}
+
+enum Sexo {
+  MACHO
+  FEMEA
+}
+
+model Pet {
+  id             String    @id @default(cuid())
+  nome           String
+  fotoUrl        String?
+  especie        Especie
+  raca           String
+  sexo           Sexo
+  dataNascimento DateTime?
+  pesoKg         Float?
+  observacoes    String?
+  // "Padrão do Pet": cadastrado uma vez, reaproveitado em todo atendimento futuro.
+  padraoPet      String?
+
+  clienteId String
+  cliente   Cliente @relation(fields: [clienteId], references: [id])
+
+  agendamentos Agendamento[]
+  pacotes      Pacote[]
+
+  @@index([clienteId])
+}
+
+// Serviço não tem preço: o valor é livre e definido em cada atendimento.
+model Servico {
+  id    String  @id @default(cuid())
+  nome  String  @unique
+  ativo Boolean @default(true)
+
+  agendamentoServicos AgendamentoServico[]
+}
+
+// Fluxo simplificado (01/08/2026): AGENDADO → PRONTO → FINALIZADO, mais
+// CANCELADO. As etapas intermediárias saíram a pedido da cliente — ninguém
+// para o banho no meio para tocar num botão.
+//
+// EM_ATENDIMENTO continua declarado só para o expand/contract (CLAUDE.md →
+// "Migrations no deploy"): nenhum código escreve esse valor desde 01/08/2026 e
+// as linhas que o tinham já viraram AGENDADO. Some num deploy futuro, sozinho.
+enum StatusAgendamento {
+  AGENDADO
+  PRONTO
+  FINALIZADO
+  CANCELADO
+  EM_ATENDIMENTO
+}
+
+// Idem: sem etapas intermediárias, o status sozinho já diz tudo. Mantido só
+// para o campo `Agendamento.etapa` continuar tipado até o deploy que o remove.
+enum EtapaAtendimento {
+  BANHO_FINALIZADO
+  TOSA_FINALIZADA
+  PET_PRONTO
+  ENTREGUE
+}
+
+model Agendamento {
+  id                 String            @id @default(cuid())
+  dataHora           DateTime
+  status             StatusAgendamento @default(AGENDADO)
+  // Sobra do fluxo antigo de 5 etapas. Desde 01/08/2026 nada lê nem escreve
+  // este campo (o status já distingue agendado/pronto/entregue) e todas as
+  // linhas foram zeradas. Declarado só para schema e banco baterem até o
+  // deploy que dropa a coluna — mesmo caso de `motivoCancelamento`.
+  etapa              EtapaAtendimento?
+  observacoes        String?
+  // Valor livre por atendimento, sempre em centavos. Nulo = "valor a definir":
+  // o agendamento pode ser salvo em branco e preenchido na entrega.
+  valorTotal         Int?
+  // Motivo opcional do cancelamento. A coluna já existia no banco desde 29/07/2026
+  // e estava fora do schema, o que fazia `migrate dev` acusar drift e se oferecer
+  // para resetar o banco. Nenhum código lê ou escreve este campo hoje: ele espera
+  // a refação de "cancelar agendamento". Declarado aqui para schema e banco
+  // finalmente baterem — ver CLAUDE.md → "Ambientes de banco".
+  motivoCancelamento String?
+
+  petId String
+  pet   Pet    @relation(fields: [petId], references: [id])
+
+  // INTENÇÃO de usar o pacote, marcada no agendamento — não é reserva de saldo.
+  // O consumo de verdade só acontece no fechamento (`PacoteConsumo`), que
+  // reconfere o saldo na hora: entre agendar e atender o pacote pode ter
+  // acabado ou vencido, e aí a tela avisa e cai na cobrança normal em vez de
+  // consumir um banho que não existe.
+  pacoteId String?
+  pacote   Pacote? @relation(fields: [pacoteId], references: [id])
+
+  servicos    AgendamentoServico[]
+  atendimento Atendimento?
+
+  @@index([petId])
+  @@index([dataHora])
+}
+
+// Ligação agendamento <-> serviço. valorCobrado é o snapshot de preço por serviço
+// da época em que Servico tinha valorPadrao — preservado nos registros antigos e
+// sempre nulo nos novos, já que agora só existe o valor total do atendimento.
+model AgendamentoServico {
+  id           String @id @default(cuid())
+  valorCobrado Int?
+
+  agendamentoId String
+  agendamento   Agendamento @relation(fields: [agendamentoId], references: [id], onDelete: Cascade)
+
+  servicoId String
+  servico   Servico @relation(fields: [servicoId], references: [id])
+
+  @@unique([agendamentoId, servicoId])
+}
+
+// Sobra do tempo em que a forma de pagamento era genérica, antes do controle de
+// taxas (02/08/2026). Renomeado de `FormaPagamento` para liberar o nome ao
+// model novo. NENHUM código escreve `Atendimento.formaPagamento` desde então —
+// mesmo caso de `Agendamento.etapa`: some num segundo deploy, sozinho
+// (CLAUDE.md → "Migrations no deploy", expand/contract).
+enum FormaPagamentoLegado {
+  DINHEIRO
+  PIX
+  CREDITO
+  DEBITO
+  OUTRO
+}
+
+// Agrupa as formas no seletor e dá o comportamento: só CREDITO pergunta
+// parcelamento. É por isso que "Visa débito" e "Visa crédito" são duas linhas
+// e não uma com um flag.
+enum TipoPagamento {
+  DINHEIRO
+  PIX
+  DEBITO
+  CREDITO
+}
+
+/**
+ * Forma de pagamento: virou tabela em 02/08/2026 porque as taxas precisam ser
+ * editáveis pela dona (a maquininha muda os percentuais com o tempo) e um enum
+ * exigiria deploy a cada mudança.
+ * Uma linha por bandeira+modalidade ("Visa débito", "Visa crédito"). Pix
+ * Conta 1 e Pix Conta 2 são linhas separadas apesar de as duas terem taxa zero:
+ * a separação existe para saber em qual conta o dinheiro entrou.
+ */
+model FormaPagamento {
+  id     String        @id
+  nome   String        @unique
+  tipo   TipoPagamento
+  // Rótulo curto do segundo nível do seletor ("Visa", "Conta 1").
+  rotulo String
+  ativo  Boolean       @default(true)
+  ordem  Int
+  // Formas criadas só para receber os pagamentos anteriores ao controle de
+  // taxas. Ficam fora do seletor e são identificáveis no relatório — a taxa
+  // delas é desconhecida, não zero.
+  legado Boolean       @default(false)
+
+  taxas               TaxaFormaPagamento[]
+  atendimentos        Atendimento[]
+  pacotes             Pacote[]
+  estornos            PacoteEstorno[]
+  estornosAtendimento AtendimentoEstorno[]
+
+  @@index([ativo, ordem])
+}
+
+/**
+ * Taxa por número de parcelas. Débito, Pix e dinheiro têm uma linha só
+ * (`parcelas = 1`); crédito tem quatro (à vista, 2x, 3x, 4x).
+ */
+model TaxaFormaPagamento {
+  id       String @id @default(cuid())
+  parcelas Int
+  // Percentual em pontos-base: 339 = 3,39%. Inteiro pelo mesmo motivo que
+  // dinheiro é centavo — ponto flutuante não entra em conta que vai para a
+  // contabilidade.
+  //
+  // NULO = "ainda não configurada" (é o caso da Amex), e NÃO zero. Sem essa
+  // distinção uma taxa não preenchida seria indistinguível de uma taxa que
+  // realmente é 0% — a mesma armadilha de `valorTotal` nulo virar R$ 0,00.
+  taxaBps  Int?
+
+  formaPagamentoId String
+  forma            FormaPagamento @relation(fields: [formaPagamentoId], references: [id], onDelete: Cascade)
+
+  @@unique([formaPagamentoId, parcelas])
+}
+
+// Histórico: criado automaticamente quando um Agendamento vira FINALIZADO.
+model Atendimento {
+  id                 String                @id @default(cuid())
+  data               DateTime              @default(now())
+  servicosRealizados String
+  // Sempre em centavos. Nulo quando o atendimento foi fechado com "Receber
+  // depois" sem valor definido — não entra no faturamento até ser preenchido.
+  valorTotal         Int?
+  // Nome do usuário logado que finalizou o atendimento — gravado automaticamente.
+  //
+  // O NOME é snapshot de propósito: a pessoa pode se renomear em /conta, e o
+  // histórico não deve passar a dizer outra coisa depois do fato. O ID ao lado
+  // é quem desempata — `atualizarNomeAction` não valida unicidade de nome, e
+  // sem ele a autoria seria uma string que não volta para um usuário.
+  //
+  // O id é NULO nos registros anteriores a 05/08/2026. Nulo aqui significa
+  // "anterior ao registro de autoria", e a tela precisa dizer isso — nunca
+  // "sem responsável", que afirmaria que ninguém fez.
+  responsavel        String
+  responsavelId      String?
+  // CONGELADA. Era a forma de pagamento quando ela ainda era um enum genérico.
+  // Nada lê nem escreve este campo desde 02/08/2026 — quem manda é `formaId`.
+  // Continua declarada só para schema e banco baterem até o deploy que a dropa,
+  // junto do enum (expand/contract, mesmo caso de `Agendamento.etapa`).
+  formaPagamento     FormaPagamentoLegado?
+  // Quando o dinheiro efetivamente entrou. Separada de `data` (quando o
+  // atendimento foi feito) porque "Receber depois" descola as duas: um banho
+  // do dia 28 pago no dia 02 é faturamento do dia 02 — regime de caixa.
+  //
+  // INVARIANTE, e é ela que impede o valor de ser contado duas vezes:
+  //   formaId != null  <=>  dataRecebimento != null
+  // Os dois são sempre escritos juntos, na mesma transação (lib/recebimento.ts).
+  // Assim toda consulta de faturamento filtra por ESTA data e o dinheiro tem um
+  // período só. Não introduza um caminho que grave um sem o outro.
+  dataRecebimento    DateTime?
+  // Quem deu a baixa, e quando (a data acima). Gravado junto com a forma e a
+  // data por `registrarRecebimento`, a única escrita de recebimento — as três
+  // telas que dão baixa (Caixa, ficha do agendamento, fechamento) herdam isto
+  // de graça, que é o retorno de existir um caminho de escrita só.
+  //
+  // Separado de `responsavel` porque são pessoas diferentes no caso comum: quem
+  // entregou o pet pela manhã pode não ser quem recebeu o dinheiro à tarde.
+  // Nulo = anterior a 05/08/2026 (ver `responsavelId`).
+  recebidoPor        String?
+  recebidoPorId      String?
+  // Forma de pagamento escolhida na venda.
+  formaId            String?
+  forma              FormaPagamento?       @relation(fields: [formaId], references: [id])
+  // Parcelamento do crédito: 1 = à vista. Nulo fora do crédito.
+  parcelas           Int?
+  // SNAPSHOT da taxa no momento da venda, em pontos-base (339 = 3,39%).
+  //
+  // Guardada aqui, e não lida da tabela na hora de exibir, porque a dona edita
+  // os percentuais quando a maquininha muda: sem o snapshot, mudar a taxa hoje
+  // recalcularia todo o histórico e o fechamento do mês passado deixaria de
+  // bater com o que foi enviado à contabilidade — o mesmo motivo que fez o
+  // faturamento virar regime de caixa.
+  //
+  // NULO = taxa desconhecida (pagamento anterior ao controle de taxas, ou forma
+  // ainda não configurada). Nesse caso o líquido é igual ao bruto, mas a tela
+  // diz "não registrada" em vez de "0,00%".
+  taxaBps            Int?
+  observacoes        String?
+
+  agendamentoId String      @unique
+  agendamento   Agendamento @relation(fields: [agendamentoId], references: [id])
+
+  // Preenchido quando esta visita saiu de um pacote. A linha NÃO tem valor: é
+  // um elo. É essa ausência que impede o dinheiro do pacote de ser contado
+  // aqui também — ver o cabeçalho de `Pacote`.
+  consumoPacote PacoteConsumo?
+
+  // Dinheiro devolvido ao cliente. Enquanto houver estorno, este atendimento
+  // NÃO pode ser apagado — a relação é obrigatória do lado do estorno, então o
+  // próprio banco recusa o delete. É a segunda camada da regra de 05/08/2026.
+  estornos AtendimentoEstorno[]
+
+  // O caixa e o dashboard filtram por data de recebimento; a listagem de
+  // pendências busca `formaId IS NULL` ordenado pela data do atendimento.
+  @@index([dataRecebimento])
+  @@index([data])
+}
+
+/**
+ * Dinheiro que VOLTOU ao cliente depois de um atendimento pago (05/08/2026).
+ * ── ESTORNO NÃO É CORREÇÃO, E ESSA É A DECISÃO ───────────────────────────
+ * Só entra aqui o dinheiro que se moveu de verdade. Valor digitado errado e
+ * percebido no mesmo dia é CORREÇÃO: edita o próprio `Atendimento` sem tocar
+ * em `dataRecebimento` (`corrigirRecebimentoAction`). Estornar um erro de
+ * digitação faria o sistema afirmar que "R$ 85 entraram e R$ 85 voltaram" —
+ * dois fatos que nunca aconteceram, indo para a contabilidade como reais. É a
+ * mesma recusa que impede valor nulo de virar R$ 0,00 e taxa nula de virar 0%.
+ * Antes disso, "Voltar uma etapa" APAGAVA o `Atendimento`, recebimento
+ * incluído: o faturamento de um período já fechado mudava sozinho e não
+ * sobrava linha nenhuma dizendo que existiu. Este model é o que substitui
+ * aquele delete.
+ * `data` é a data CONTÁBIL e segue o REGIME DE CAIXA, igual ao
+ * `PacoteEstorno`: é o dia da DEVOLUÇÃO, nunca o do recebimento original.
+ * Devolver no mesmo dia se anula sozinho; devolver no mês seguinte deixa
+ * intacto o mês que a contadora já recebeu.
+ * É tabela, e não um flag `estornadoEm` no atendimento, pela mesma razão do
+ * `PacoteEstorno`: um estorno PARCIAL, se um dia existir, é a mesma linha com
+ * valor menor — sem um segundo mecanismo de "dinheiro que voltou" para
+ * reconciliar, que é como uma conta deixa de fechar.
+ */
+model AtendimentoEstorno {
+  id         String   @id @default(cuid())
+  // Centavos, POSITIVO. Quem subtrai é a consulta de faturamento — guardar
+  // negativo faria toda soma depender de lembrar do sinal.
+  valor      Int
+  data       DateTime
+  motivo     String?
+  // Quem devolveu, e quando apertou o botão (`criadoEm` é operacional e não se
+  // confunde com `data`, que é contábil). O nome é snapshot para a exibição não
+  // mudar se a pessoa se renomear; o id é quem desempata, já que dois usuários
+  // podem em tese ter o mesmo nome de exibição.
+  feitoPor   String
+  feitoPorId String
+  criadoEm   DateTime @default(now())
+  // Snapshot da taxa estornada, para o líquido voltar junto com o bruto — senão
+  // devolver o dinheiro deixaria a taxa pendurada no relatório.
+  taxaBps    Int?
+
+  // Sem `onDelete: Cascade`, de propósito, e é o oposto do `PacoteConsumo`: o
+  // registro de dinheiro devolvido tem que sobreviver a quem quiser apagá-lo.
+  atendimentoId String
+  atendimento   Atendimento @relation(fields: [atendimentoId], references: [id])
+
+  // Por onde o dinheiro voltou.
+  formaId String?
+  forma   FormaPagamento? @relation(fields: [formaId], references: [id])
+
+  @@index([atendimentoId])
+  @@index([data])
+}
+
+/**
+ * PACOTE DE BANHOS pré-pago (03/08/2026). Pacote de 2 ou 4 banhos, comprado
+ * adiantado, válido por 30 dias. O pacote é do PET, não do tutor.
+ * ── A GARANTIA CONTRA CONTAR DUAS VEZES ──────────────────────────────────
+ * O dinheiro do sistema entra em DUAS tabelas, e elas são disjuntas por
+ * construção:
+ * Pacote.valorTotal          reconhecido em Pacote.dataRecebimento
+ * Atendimento.valorTotal     reconhecido em Atendimento.dataRecebimento
+ * NENHUM campo do Atendimento jamais recebe o valor do pacote, e
+ * `PacoteConsumo` não tem coluna de valor. Por isso os mesmos centavos não têm
+ * como aparecer nas duas pontas — não é uma regra a lembrar, é a falta de um
+ * lugar onde o erro caberia. Num atendimento que usa pacote, `valorTotal`
+ * significa SOMENTE o serviço extra daquele dia (0 quando não houve extra).
+ * **A única forma de quebrar isso é escrever `Atendimento.valorTotal` a partir
+ * do valor de um pacote. É a linha a vigiar em qualquer revisão.**
+ * Vale a mesma invariante do atendimento, aqui trivialmente: o pacote é pago
+ * na compra, então `valorTotal`, `formaId` e `dataRecebimento` são NOT NULL —
+ * não existe "receber depois" de pacote.
+ * VALIDADE É DERIVADA, não gravada: ativo / encerrado (saldo zerou) / expirado
+ * (passou de `validadeAte` com saldo). Um `status` gravado exigiria um job para
+ * virar — e este projeto não tem scheduler nenhum (só o backup no GitHub
+ * Actions), então o campo ficaria errado entre execuções. Ver lib/pacotes.ts.
+ */
+model Pacote {
+  id           String   @id @default(cuid())
+  // 2 ou 4. Int, e não enum, porque um pacote de 6 é mudança de dado e não de
+  // código — mesma razão de a taxa ter virado tabela.
+  banhosTotal  Int
+  // Centavos. Valor livre, digitado na venda: o preço varia por cachorro, igual
+  // ao resto do sistema (CLAUDE.md → regra permanente).
+  valorTotal   Int
+  dataCompra   DateTime @default(now())
+  // dataCompra + 30 dias, calculada na venda e GRAVADA. Congelar aqui mantém a
+  // validade estável se um dia a regra dos 30 dias mudar: pacote vendido sob a
+  // regra antiga continua com a validade que foi combinada com a cliente.
+  validadeAte  DateTime
+  // Nome do usuário logado que vendeu — mesmo padrão de Atendimento.responsavel,
+  // id ao lado do nome pelo mesmo motivo. Nulo = anterior a 05/08/2026.
+  vendidoPor   String
+  vendidoPorId String?
+  observacoes  String?
+
+  // Dinheiro: mesma disciplina do Atendimento. A taxa é SNAPSHOT do dia da
+  // venda (nula = desconhecida, nunca 0) e é resolvida no servidor a partir de
+  // forma + parcelas.
+  formaId         String
+  forma           FormaPagamento @relation(fields: [formaId], references: [id])
+  parcelas        Int?
+  taxaBps         Int?
+  dataRecebimento DateTime
+
+  petId String
+  pet   Pet    @relation(fields: [petId], references: [id])
+
+  consumos     PacoteConsumo[]
+  estornos     PacoteEstorno[]
+  agendamentos Agendamento[]
+
+  @@index([petId])
+  // O faturamento filtra por esta data, igual ao Atendimento.
+  @@index([dataRecebimento])
+}
+
+/**
+ * Um banho consumido do pacote. Elo puro: NÃO tem valor, de propósito (ver o
+ * cabeçalho de `Pacote`).
+ * `indice` é atribuído na hora do consumo (`max + 1`, dentro da transação), e
+ * não no agendamento: a cliente marca os 4 sábados de uma vez, e numerar antes
+ * renumeraria tudo assim que uma visita acontecesse fora de ordem. É o
+ * @@unique([pacoteId, indice]) que torna o último banho seguro contra dois
+ * toques ao mesmo tempo.
+ * O cascade a partir do Atendimento é intencional: "Voltar uma etapa" apaga o
+ * Atendimento, e o banho precisa voltar para o saldo junto.
+ */
+model PacoteConsumo {
+  id       String   @id @default(cuid())
+  indice   Int
+  criadoEm DateTime @default(now())
+
+  pacoteId String
+  pacote   Pacote @relation(fields: [pacoteId], references: [id])
+
+  atendimentoId String      @unique
+  atendimento   Atendimento @relation(fields: [atendimentoId], references: [id], onDelete: Cascade)
+
+  @@unique([pacoteId, indice])
+  @@index([pacoteId])
+}
+
+/**
+ * Dinheiro que VOLTOU de um pacote. Hoje só existe um caso — o cancelamento de
+ * uma venda registrada errado, permitido apenas enquanto nenhum banho foi
+ * consumido — e ele entra aqui como um estorno de 100%.
+ * É tabela, e não um campo `canceladoEm` no Pacote, de propósito: assim um
+ * estorno PARCIAL (devolver parte depois de consumir alguns banhos) é a mesma
+ * linha com valor menor, sem trava de consumo. Se o cancelamento fosse um flag,
+ * o estorno parcial precisaria de um segundo mecanismo, e passariam a existir
+ * dois caminhos de "dinheiro que voltou" para reconciliar — que é como uma
+ * conta deixa de fechar.
+ * `data` é a data CONTÁBIL — o dia em que o valor sai do faturamento — e segue
+ * o REGIME DE CAIXA como todo o resto: é o dia do CANCELAMENTO, nunca o da
+ * venda. Cancelar no mesmo dia se anula sozinho (venda e estorno caem juntos);
+ * cancelar no mês seguinte deixa intacto o mês que a contadora já recebeu.
+ * Datar pelo dia da venda reescreveria um período fechado, que é exatamente o
+ * modo de falha que o regime de caixa existe para evitar.
+ * `criadoEm` é quando alguém apertou o botão e `pacoteId` mantém o vínculo com
+ * a venda original, para a rastreabilidade não depender da data.
+ */
+model PacoteEstorno {
+  id         String   @id @default(cuid())
+  // Centavos, POSITIVO. Quem subtrai é a consulta de faturamento — guardar
+  // negativo faria toda soma depender de lembrar do sinal.
+  valor      Int
+  data       DateTime
+  motivo     String?
+  // Quem cancelou e quando. Id ao lado do nome desde 05/08/2026 (nulo antes) —
+  // mesmo motivo de `Atendimento.responsavelId`.
+  feitoPor   String
+  feitoPorId String?
+  criadoEm   DateTime @default(now())
+  // Snapshot da taxa estornada, para o líquido voltar junto com o bruto.
+  taxaBps    Int?
+
+  pacoteId String
+  pacote   Pacote @relation(fields: [pacoteId], references: [id])
+
+  formaId String?
+  forma   FormaPagamento? @relation(fields: [formaId], references: [id])
+
+  @@index([pacoteId])
+  @@index([data])
+}
+
+/**
+ * REGISTRO DE ATIVIDADE (05/08/2026) — quem fez o quê, para o que não deixa
+ * linha própria.
+ * ── POR QUE UMA TABELA, E NÃO MAIS COLUNAS ───────────────────────────────
+ * Os campos de autoria (`responsavelId`, `recebidoPorId`, ...) resolvem "quem
+ * fez isto?" enquanto a linha existe. Não resolvem dois casos:
+ * 1. A linha SOME. Excluir um cliente ou um pet apaga tudo — não sobra onde
+ * pendurar uma coluna, e a pergunta "quem apagou a ficha da Mila?" fica
+ * sem lugar nenhum para ser respondida.
+ * 2. Precisa do ANTES. "A taxa mudou" não ajuda; "3,39% → 4,10%" ajuda. Uma
+ * coluna guarda um valor, nunca dois. A taxa é o caso extremo: o
+ * `TaxaFormaPagamento` é sobrescrito no lugar, então o percentual antigo
+ * é IRRECUPERÁVEL sem isto (os atendimentos guardam o snapshot deles, mas
+ * a linha da tabela, não).
+ * ── APPEND-ONLY ──────────────────────────────────────────────────────────
+ * Nada aqui é editado ou apagado, nunca. Um registro que pode ser reescrito
+ * não responde "o que aconteceu?" — responde "o que alguém quis que parecesse
+ * ter acontecido". Não há action de update nem de delete sobre esta tabela.
+ * `usuarioNome` é snapshot e `usuarioId` desempata, pelo mesmo motivo dos
+ * outros campos de autoria (ver lib/autoria.ts).
+ * `descricao` é a frase PRONTA, em português, escrita no momento do fato. Fica
+ * congelada de propósito: a tela não precisa de um switch gigante para montar
+ * texto, e um registro antigo não passa a ser descrito de outro jeito quando o
+ * código muda. Mesmo princípio do `taxaBps` snapshot.
+ * `criadoEm` é OPERACIONAL — quando alguém apertou o botão. NÃO se confunde
+ * com data contábil (`dataRecebimento`, `PacoteEstorno.data`): registrar
+ * atividade nunca move dinheiro de período. Os dois eixos não se cruzam.
+ */
+model RegistroAtividade {
+  id          String   @id @default(cuid())
+  criadoEm    DateTime @default(now())
+  usuarioId   String
+  usuarioNome String
+  // Slug do que aconteceu ("cliente.excluido", "taxa.alterada"). String e não
+  // enum de banco: acrescentar uma ação nova vira mudança de código, não
+  // migration — mesma razão de `Pacote.banhosTotal` ser Int.
+  acao        String
+  entidade    String
+  // Nulo quando a entidade deixou de existir e o id não leva a lugar nenhum.
+  entidadeId  String?
+  descricao   String
+  // Só onde o valor importa (taxa, valor cobrado, motivo apagado). Não é diff
+  // de linha inteira: isso viraria ruído que ninguém lê.
+  antes       Json?
+  depois      Json?
+
+  // A tela lista do mais recente para o mais antigo; o índice por entidade
+  // serve para "o que já aconteceu com este pet?".
+  @@index([criadoEm])
+  @@index([entidade, entidadeId])
+}

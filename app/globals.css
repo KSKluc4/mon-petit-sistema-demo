@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+:root {
+  /* Fundo off-white levemente quente — não branco puro, não cinza frio. */
+  --background: #faf7f2;
+  --foreground: #23201c;
+}
+
+@theme {
+  /* Verde-petróleo/teal — cor principal da marca. 600+ é o mínimo seguro
+     para texto branco sobre fundo colorido (contraste AA). */
+  --color-brand-50: #eefbfb;
+  --color-brand-100: #d3f3f2;
+  --color-brand-200: #a8e7e6;
+  --color-brand-300: #74d3d2;
+  --color-brand-400: #3fb6b5;
+  --color-brand-500: #189a9a;
+  --color-brand-600: #107f7f;
+  --color-brand-700: #0c6666;
+  --color-brand-800: #0a5252;
+  --color-brand-900: #084141;
+
+  /* Laranja — cor de acento. 700+ é o mínimo seguro para texto branco. */
+  --color-accent-50: #fff7ed;
+  --color-accent-100: #ffecd1;
+  --color-accent-200: #ffd6a3;
+  --color-accent-300: #ffb86b;
+  --color-accent-400: #f89843;
+  --color-accent-500: #f09040;
+  --color-accent-600: #dd7a22;
+  --color-accent-700: #b35f16;
+  --color-accent-800: #8a4a12;
+  --color-accent-900: #6b3a11;
+
+  --font-display: var(--font-nunito), ui-rounded, "Segoe UI", sans-serif;
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+}
+
+/* Tema fixo (claro) — o app não foi desenhado para modo escuro do sistema. */
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+h1,
+h2,
+h3,
+.font-display {
+  font-family: var(--font-display);
+}

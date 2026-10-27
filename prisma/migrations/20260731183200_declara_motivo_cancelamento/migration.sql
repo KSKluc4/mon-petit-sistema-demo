@@ -1,0 +1,16 @@
+-- Fecha o único drift conhecido entre o banco e o schema.prisma.
+--
+-- A coluna "motivoCancelamento" foi criada no banco em 29/07/2026 por uma
+-- migration local que depois foi descartada (ver CLAUDE.md → "Regras
+-- permanentes"). A coluna ficou lá, fora do schema — inofensiva em runtime,
+-- mas suficiente para `prisma migrate dev` acusar drift e se oferecer para
+-- RESETAR o banco, que naquele momento era o de produção.
+--
+-- Em vez de dropar a coluna, ela passa a ser declarada no schema: é nullable,
+-- não custa nada, e o recurso "cancelar agendamento" será refeito em cima dela.
+--
+-- `IF NOT EXISTS` porque no banco de produção a coluna já existe (aqui a
+-- migration é no-op e serve só para registrar o estado), enquanto num banco
+-- novo — criado do zero ou restaurado por `pg_restore` de um dump anterior a
+-- 29/07 — ela precisa ser criada de fato.
+ALTER TABLE "Agendamento" ADD COLUMN IF NOT EXISTS "motivoCancelamento" TEXT;
